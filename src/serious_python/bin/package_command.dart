@@ -44,10 +44,15 @@ class PackageCommand extends Command {
     argParser.addFlag("mobile", help: "Package for mobile.", negatable: false);
     argParser.addFlag("web", help: "Package for web.", negatable: false);
     argParser.addFlag("verbose", help: "Verbose output.", negatable: false);
+    argParser.addFlag("archive",
+        help: "Package as an archive or a directory.", negatable: false);
+    argParser.addOption('optional-deps',
+        help:
+            "Which optional dependencies section in pyproject.toml to use as dependencies.");
     argParser.addOption('asset',
         abbr: 'a',
         help:
-            "Asset path, relative to pubspec.yaml, to package Python program into.");
+            "Asset path, relative to pubspec.yaml, to package Python program into; Should be a path to a directory if packaging as a directory");
     argParser.addOption('dep-mappings',
         help: "Pip dependency mappings in the format 'dep1>dep2,dep3>dep4'.");
     argParser.addOption('req-deps',
@@ -87,6 +92,8 @@ class PackageCommand extends Command {
       bool pre = argResults?["pre"];
       bool mobile = argResults?["mobile"];
       bool web = argResults?["web"];
+      bool archive = argResults?["archive"];
+      String? opDepsArg = argResults?['optional-deps'];
       String? depMappingsArg = argResults?['dep-mappings'];
       String? reqDepsArg = argResults?['req-deps'];
       String? findLinksArg = argResults?['find-links'];
@@ -118,16 +125,28 @@ class PackageCommand extends Command {
 
       // asset path
       if (assetPath == null) {
-        assetPath = "app/app.zip";
+        if (archive) {
+          assetPath = "app/app.zip";
+        } else {
+          assetPath = "app";
+        }
       } else if (assetPath.startsWith("/") || assetPath.startsWith("\\")) {
         assetPath = assetPath.substring(1);
       }
 
       // create dest dir
-      final dest = File(path.join(currentPath, assetPath));
-      if (!await dest.parent.exists()) {
-        stdout.writeln("Creating asset directory: ${dest.parent.path}");
-        await dest.parent.create(recursive: true);
+      final destFile = File(path.join(currentPath, assetPath));
+      final destDir = Directory(path.join(currentPath, assetPath));
+      if (archive) {
+        if (!await destFile.parent.exists()) {
+          stdout.writeln("Creating asset directory: ${destFile.parent.path}");
+          await destFile.parent.create(recursive: true);
+        }
+      } else {
+        if (!await destDir.exists()) {
+          stdout.writeln("Creating asset directory: ${destDir.path}");
+          await destDir.create(recursive: true);
+        }
       }
 
       // create temp dir
@@ -155,47 +174,13 @@ class PackageCommand extends Command {
         final content = await pyprojectFile.readAsString();
         final document = TomlDocument.parse(content).toMap();
         var depSection = findTomlDependencies(document);
+        var opDepSection =
+            findTomlDependencies(document, optionalDeps: opDepsArg);
         if (depSection != null) {
-          if (depSection is List) {
-            dependencies = depSection.map((e) => e.toString()).toList();
-          } else {
-            dependencies = List<String>.from(depSection.keys.map((key) {
-              if (tomlIgnoredDeps.contains(key)) {
-                return "";
-              }
-              var value = depSection[key];
-              var version = "";
-              var suffix = "";
-              if (value is Map) {
-                version = value["version"];
-                if (value["python"] != null) {
-                  suffix = ";python_version=='${value["python"]}'"
-                      .replaceAll("=='^", ">='")
-                      .replaceAll("=='~", "~='")
-                      .replaceAll("=='<", "<'")
-                      .replaceAll("=='>", ">'")
-                      .replaceAll("=='<=", "<='")
-                      .replaceAll("=='>=", ">='");
-                } else if (value["markers"] != null) {
-                  suffix = ";${value["markers"]}";
-                }
-              } else if (value is String) {
-                version = value;
-              }
-              var sep = "==";
-              if (version.startsWith("^")) {
-                sep = ">=";
-                version = version.replaceAll("^", "");
-              } else if (version.startsWith("~")) {
-                sep = "~=";
-                version = version.replaceAll("~", "");
-              } else if (version.contains(">") || version.contains("<")) {
-                sep = "";
-                version = version.replaceAll(" ", "");
-              }
-              return "$key$sep$version$suffix";
-            })).where((s) => s != "").toList();
-          }
+          dependencies = convertDependenciesToList(depSection);
+        }
+        if (opDepSection != null) {
+          dependencies.addAll(convertDependenciesToList(opDepSection));
         }
       }
 
@@ -232,9 +217,6 @@ class PackageCommand extends Command {
           }
         }
       }
-
-      // stdout.writeln(dependencies);
-      // exit(1);
 
       List<String> extraArgs = [];
       if (pre) {
@@ -341,13 +323,21 @@ class PackageCommand extends Command {
           "Delete unnecessary files and directories: $junkFilesAndDirectories");
       await cleanupPyPackages(tempDir, fileExtensions, junkFilesAndDirectories);
 
-      // create archive
-      stdout
-          .writeln("Creating app archive at ${dest.path} from ${tempDir.path}");
-      final encoder = ZipFileEncoder();
-      encoder.zipDirectory(tempDir, filename: dest.path);
-    } catch (e) {
+      if (archive) {
+        // create archive
+        stdout.writeln(
+            "Creating app archive at ${destFile.path} from ${tempDir.path}");
+        final encoder = ZipFileEncoder();
+        encoder.zipDirectory(tempDir, filename: destFile.path);
+      } else {
+        stdout.writeln(
+            "Creating app directory at ${destDir.path} from ${tempDir.path}");
+        await copyDirectory(
+            Directory(tempDir.path), Directory(destDir.path), tempDir.path, []);
+      }
+    } catch (e, stacktrace) {
       stdout.writeln("Error: $e");
+      stdout.writeln("Stack:\n$stacktrace");
     } finally {
       if (tempDir != null && await tempDir.exists()) {
         stdout.writeln("Deleting temp directory ${tempDir.path}");
@@ -365,14 +355,75 @@ class PackageCommand extends Command {
     }
   }
 
-  dynamic findTomlDependencies(Map<String, dynamic> section) {
-    if (section.containsKey('dependencies')) {
-      return section['dependencies'];
+  List<String> convertDependenciesToList(dynamic depSection) {
+    if (depSection != null) {
+      if (depSection is List) {
+        return depSection.map((e) => e.toString()).toList();
+      } else {
+        return List<String>.from(depSection.keys.map((key) {
+          if (tomlIgnoredDeps.contains(key)) {
+            return "";
+          }
+          var value = depSection[key];
+          var version = "";
+          var suffix = "";
+          if (value is Map) {
+            version = value["version"];
+            if (value["python"] != null) {
+              suffix = ";python_version=='${value["python"]}'"
+                  .replaceAll("=='^", ">='")
+                  .replaceAll("=='~", "~='")
+                  .replaceAll("=='<", "<'")
+                  .replaceAll("=='>", ">'")
+                  .replaceAll("=='<=", "<='")
+                  .replaceAll("=='>=", ">='");
+            } else if (value["markers"] != null) {
+              suffix = ";${value["markers"]}";
+            }
+          } else if (value is String) {
+            version = value;
+          }
+          var sep = "==";
+          if (version.startsWith("^")) {
+            sep = ">=";
+            version = version.replaceAll("^", "");
+          } else if (version.startsWith("~")) {
+            sep = "~=";
+            version = version.replaceAll("~", "");
+          } else if (version.contains(">") || version.contains("<")) {
+            sep = "";
+            version = version.replaceAll(" ", "");
+          }
+          return "$key$sep$version$suffix";
+        })).where((s) => s != "").toList();
+      }
+    }
+    return [];
+  }
+
+  dynamic findTomlDependencies(Map<String, dynamic> section,
+      {String? optionalDeps}) {
+    if (optionalDeps == null) {
+      if (section.containsKey('dependencies')) {
+        return section['dependencies'];
+      }
+    } else {
+      if (section.containsKey('optional-dependencies')) {
+        if (section['optional-dependencies'] is! Map ||
+            !(section['optional-dependencies'] as Map)
+                .containsKey(optionalDeps)) {
+          stderr
+              .writeln("Cannot find optional dependencies from pyproject.toml");
+          exit(3);
+        }
+        return section['optional-dependencies'][optionalDeps];
+      }
     }
 
     for (final value in section.values) {
       if (value is Map<String, dynamic>) {
-        final dependencies = findTomlDependencies(value);
+        final dependencies =
+            findTomlDependencies(value, optionalDeps: optionalDeps);
         if (dependencies != null) {
           return dependencies;
         }
